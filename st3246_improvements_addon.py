@@ -1,0 +1,572 @@
+import os
+os.environ["MPLCONFIGDIR"] = os.path.join(os.getcwd(), ".mplconfig")
+
+from pathlib import Path
+import json
+import importlib.util
+from typing import Dict, Tuple
+import time
+
+import numpy as np
+import pandas as pd
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ORIGINAL_PIPELINE = BASE_DIR / "final_project_all_methods.py"
+OUTPUT_DIR = BASE_DIR / "outputs_improvement_addon"
+
+# ---------------------------------------------------------------------
+# USER-ADJUSTABLE SETTINGS
+# ---------------------------------------------------------------------
+THETA_TRUE = np.array([0.18, 0.08, 0.30], dtype=float)
+SYNTHETIC_DATA_SEED = 20260416
+
+RECOVERY_N_DRAWS = 2500
+RECOVERY_ACCEPT_FRACTION = 0.05
+RECOVERY_SL_N_ITER = 1200
+RECOVERY_SL_BURN = 300
+RECOVERY_SL_THIN = 3
+RECOVERY_SL_ESTIMATION_REPS = 16
+RECOVERY_N_PPC_REPS = 30
+
+
+# ---------------------------------------------------------------------
+# SIMPLE LOGGING HELPERS
+# ---------------------------------------------------------------------
+GLOBAL_START = time.time()
+
+
+def log(message: str):
+    elapsed = time.time() - GLOBAL_START
+    print(f"[{elapsed:8.1f}s] {message}", flush=True)
+
+
+class StepTimer:
+    def __init__(self, name: str):
+        self.name = name
+        self.start = None
+
+    def __enter__(self):
+        self.start = time.time()
+        log(f"START: {self.name}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.start
+        if exc_type is None:
+            log(f"END:   {self.name} (took {elapsed:.1f}s)")
+        else:
+            log(f"ERROR: {self.name} failed after {elapsed:.1f}s")
+
+
+# ---------------------------------------------------------------------
+# IMPORT ORIGINAL PIPELINE AS A MODULE
+# ---------------------------------------------------------------------
+def load_original_module():
+    log(f"Loading original pipeline from: {ORIGINAL_PIPELINE}")
+    spec = importlib.util.spec_from_file_location("st3246_all_methods", ORIGINAL_PIPELINE)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import original pipeline from {ORIGINAL_PIPELINE}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    log("Original pipeline loaded successfully.")
+    return module
+
+
+mod = load_original_module()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+log(f"Output directory ready: {OUTPUT_DIR}")
+
+
+# ---------------------------------------------------------------------
+# SIMULATION BUDGET COUNTER
+# ---------------------------------------------------------------------
+class SimulationBudget:
+    def __init__(self):
+        self.method_to_replicates: Dict[str, int] = {}
+        self.method_to_calls: Dict[str, int] = {}
+
+    def add(self, method: str, n_replicates: int):
+        self.method_to_replicates[method] = self.method_to_replicates.get(method, 0) + int(n_replicates)
+        self.method_to_calls[method] = self.method_to_calls.get(method, 0) + 1
+
+    def to_frame(self) -> pd.DataFrame:
+        methods = sorted(set(self.method_to_replicates) | set(self.method_to_calls))
+        rows = []
+        for method in methods:
+            rows.append({
+                "method": method,
+                "simulator_calls": int(self.method_to_calls.get(method, 0)),
+                "replicates_simulated_total": int(self.method_to_replicates.get(method, 0)),
+            })
+        return pd.DataFrame(rows)
+
+
+BUDGET = SimulationBudget()
+
+
+def simulate_mean_summary_counted(theta, n_replicates: int, seed: int, method_label: str):
+    BUDGET.add(method_label, n_replicates)
+    return mod.simulate_mean_summary(theta, n_replicates=n_replicates, seed=seed)
+
+
+# ---------------------------------------------------------------------
+# SYNTHETIC DATA GENERATION
+# ---------------------------------------------------------------------
+def simulate_dataset_to_dataframes(theta: np.ndarray, n_replicates: int, seed: int):
+    """Generate a synthetic observed dataset in the same tabular format as the assignment files."""
+    log(
+        f"Generating synthetic dataset with theta={theta.tolist()}, "
+        f"n_replicates={n_replicates}, seed={seed}"
+    )
+    rng = np.random.default_rng(seed)
+    infected_rows = []
+    rewiring_rows = []
+    degree_rows = []
+
+    progress_every = max(1, n_replicates // 10)
+
+    for rep_id in range(n_replicates):
+        if rep_id % progress_every == 0 or rep_id == n_replicates - 1:
+            log(f"Synthetic data progress: replicate {rep_id + 1}/{n_replicates}")
+
+        rep_seed = int(rng.integers(0, 2**32 - 1))
+        infected_series, rewiring_series, degree_hist = mod.simulate(
+            beta=float(theta[0]),
+            gamma=float(theta[1]),
+            rho=float(theta[2]),
+            N=mod.SIM_N,
+            p_edge=mod.SIM_P_EDGE,
+            n_infected0=mod.SIM_N_INFECTED0,
+            T=mod.SIM_T,
+            rng=np.random.default_rng(rep_seed),
+        )
+
+        for t, value in enumerate(infected_series):
+            infected_rows.append({
+                "replicate_id": rep_id,
+                "time": t,
+                "infected_fraction": float(value),
+            })
+
+        for t, value in enumerate(rewiring_series):
+            rewiring_rows.append({
+                "replicate_id": rep_id,
+                "time": t,
+                "rewire_count": float(value),
+            })
+
+        for degree, value in enumerate(degree_hist):
+            degree_rows.append({
+                "replicate_id": rep_id,
+                "degree": degree,
+                "count": float(value),
+            })
+
+    log("Synthetic dataset generation finished.")
+    return (
+        pd.DataFrame(infected_rows),
+        pd.DataFrame(rewiring_rows),
+        pd.DataFrame(degree_rows),
+    )
+
+
+# ---------------------------------------------------------------------
+# TARGETED VERSIONS OF TWO METHODS FOR THE IMPROVEMENTS SECTION
+# ---------------------------------------------------------------------
+def generate_shared_abc_draws_counted(obs_rep_summaries: np.ndarray, n_draws: int, seed: int, method_label: str):
+    log(f"Generating shared ABC draws for {method_label}: n_draws={n_draws}, seed={seed}")
+    rng = np.random.default_rng(seed)
+    n_replicates = obs_rep_summaries.shape[0]
+    params = []
+    summary_rows = []
+
+    progress_every = max(1, n_draws // 20)
+
+    for draw in range(n_draws):
+        if draw % progress_every == 0 or draw == n_draws - 1:
+            log(f"{method_label} progress: draw {draw + 1}/{n_draws}")
+
+        theta = mod.sample_prior(rng)
+        sim_seed = int(rng.integers(0, 2**32 - 1))
+        sim_mean = simulate_mean_summary_counted(
+            theta,
+            n_replicates=n_replicates,
+            seed=sim_seed,
+            method_label=method_label
+        )
+        params.append({"draw_id": draw, "beta": theta[0], "gamma": theta[1], "rho": theta[2]})
+        summary_rows.append(sim_mean)
+
+    log(f"Finished shared ABC draws for {method_label}")
+    return {
+        "params_df": pd.DataFrame(params),
+        "summary_matrix": np.vstack(summary_rows),
+    }
+
+
+def synthetic_likelihood_value_counted(theta, obs_group_mean, n_replicates, n_estimation_reps, rng, cache, method_label):
+    key = tuple(np.round(np.asarray(theta, dtype=float), mod.SL_CACHE_ROUND))
+    if key in cache:
+        return cache[key]
+
+    sim_means = []
+    for _ in range(n_estimation_reps):
+        sim_means.append(
+            simulate_mean_summary_counted(
+                theta,
+                n_replicates=n_replicates,
+                seed=int(rng.integers(0, 2**32 - 1)),
+                method_label=method_label,
+            )
+        )
+    sim_means = np.vstack(sim_means)
+
+    mu_hat = sim_means.mean(axis=0)
+    cov_hat = np.cov(sim_means, rowvar=False)
+    if cov_hat.ndim == 0:
+        cov_hat = np.array([[float(cov_hat)]])
+    cov_hat = cov_hat + mod.SL_COV_RIDGE * np.eye(cov_hat.shape[0])
+    loglik = mod.log_mvn_density(obs_group_mean, mu_hat, cov_hat)
+
+    cache[key] = {
+        "loglik": float(loglik),
+        "mu_hat": mu_hat,
+        "cov_hat": cov_hat,
+    }
+    return cache[key]
+
+
+def synthetic_likelihood_mcmc_counted(
+    obs_group_mean,
+    baseline_center,
+    n_replicates,
+    n_iter,
+    burn,
+    thin,
+    proposal_sd,
+    n_estimation_reps,
+    seed,
+    method_label,
+):
+    log(
+        f"Starting synthetic likelihood MCMC for {method_label}: "
+        f"n_iter={n_iter}, burn={burn}, thin={thin}, "
+        f"n_estimation_reps={n_estimation_reps}, seed={seed}"
+    )
+
+    rng = np.random.default_rng(seed)
+    cache = {}
+
+    current = mod.clip_theta(baseline_center)
+    current_eval = synthetic_likelihood_value_counted(
+        current, obs_group_mean, n_replicates, n_estimation_reps, rng, cache, method_label
+    )
+    current_ll = current_eval["loglik"]
+
+    chain = []
+    accepted_moves = 0
+    progress_every = max(1, n_iter // 20)
+
+    for i in range(n_iter):
+        if i % progress_every == 0 or i == n_iter - 1:
+            current_acceptance = accepted_moves / max(1, i)
+            log(
+                f"{method_label} MCMC progress: iter {i + 1}/{n_iter}, "
+                f"accepted={accepted_moves}, acceptance_rate_so_far={current_acceptance:.3f}, "
+                f"cache_size={len(cache)}"
+            )
+
+        proposal = mod.propose_theta_rw(current, proposal_sd, rng)
+        if mod.in_prior_bounds(proposal):
+            prop_eval = synthetic_likelihood_value_counted(
+                proposal, obs_group_mean, n_replicates, n_estimation_reps, rng, cache, method_label
+            )
+            prop_ll = prop_eval["loglik"]
+            log_alpha = prop_ll - current_ll
+            if np.log(rng.random()) < log_alpha:
+                current = proposal
+                current_ll = prop_ll
+                accepted_moves += 1
+                accepted_indicator = 1.0
+            else:
+                accepted_indicator = 0.0
+        else:
+            accepted_indicator = 0.0
+
+        chain.append(np.concatenate([current, [current_ll, accepted_indicator]]))
+
+    chain = np.vstack(chain)
+    chain_df = pd.DataFrame(chain, columns=mod.PARAM_NAMES + ["log_synth_like", "accepted_move"])
+    kept = chain_df.iloc[burn::thin].reset_index(drop=True)
+
+    meta = {
+        "n_iter": int(n_iter),
+        "burn": int(burn),
+        "thin": int(thin),
+        "proposal_sd": proposal_sd.tolist(),
+        "n_estimation_reps": int(n_estimation_reps),
+        "acceptance_rate": float(accepted_moves / max(1, n_iter)),
+        "cache_size": int(len(cache)),
+    }
+
+    log(
+        f"Finished synthetic likelihood MCMC for {method_label}. "
+        f"Final acceptance_rate={meta['acceptance_rate']:.3f}, "
+        f"kept_samples={len(kept)}, cache_size={meta['cache_size']}"
+    )
+    return chain_df, kept, meta
+
+
+# ---------------------------------------------------------------------
+# ANALYSIS HELPERS
+# ---------------------------------------------------------------------
+def equal_tailed_contains(samples: pd.Series, truth: float, alpha: float = 0.05) -> bool:
+    low, high = mod.equal_tailed_interval(samples.to_numpy(), alpha=alpha)
+    return bool(low <= truth <= high)
+
+
+def posterior_recovery_summary(samples_df: pd.DataFrame, method_name: str, theta_true: np.ndarray) -> pd.DataFrame:
+    rows = []
+    for i, p in enumerate(mod.PARAM_NAMES):
+        low, high = mod.equal_tailed_interval(samples_df[p].to_numpy(), alpha=0.05)
+        rows.append({
+            "method": method_name,
+            "parameter": p,
+            "true_value": float(theta_true[i]),
+            "posterior_mean": float(samples_df[p].mean()),
+            "posterior_median": float(samples_df[p].median()),
+            "ci_2.5": float(low),
+            "ci_97.5": float(high),
+            "covered_by_95ci": bool(low <= theta_true[i] <= high),
+            "abs_error_mean": float(abs(samples_df[p].mean() - theta_true[i])),
+        })
+    return pd.DataFrame(rows)
+
+
+def beta_rho_confounding(samples_df: pd.DataFrame, method_name: str) -> pd.DataFrame:
+    beta = samples_df["beta"].to_numpy(dtype=float)
+    rho = samples_df["rho"].to_numpy(dtype=float)
+    corr = np.corrcoef(beta, rho)[0, 1]
+    reg_slope = float(np.polyfit(beta, rho, 1)[0]) if len(beta) >= 2 else np.nan
+    return pd.DataFrame([
+        {
+            "method": method_name,
+            "corr_beta_rho": float(corr),
+            "slope_rho_on_beta": reg_slope,
+            "beta_sd": float(np.std(beta, ddof=1)),
+            "rho_sd": float(np.std(rho, ddof=1)),
+        }
+    ])
+
+
+def make_transparency_paragraph() -> str:
+    return (
+        "AI tools (ChatGPT) were used to help structure the code, identify implementation bugs, "
+        "and rewrite explanations into clearer academic English. However, all final model choices, "
+        "mathematical interpretations, simulation settings, and reported conclusions were checked "
+        "manually against the simulator behavior and the empirical output.\n\n"
+        "Two non-final attempts are worth noting. First, relying on infected summaries alone led to "
+        "weak identification and did not adequately pin down rewiring behavior. Second, synthetic "
+        "likelihood could produce very tight posteriors, but this was not accepted at face value; I "
+        "therefore checked posterior predictive fit and added a synthetic-truth recovery exercise to "
+        "test whether the narrow intervals were actually calibrated.\n\n"
+        "My main added value was to build a unified comparison pipeline, keep the baseline ABC "
+        "comparison fair through shared simulations, explicitly study the remaining identification "
+        "problems, and interpret the output in terms of epidemic mechanisms rather than only reporting numbers."
+    )
+
+
+# ---------------------------------------------------------------------
+# MAIN IMPROVEMENT ANALYSIS
+# ---------------------------------------------------------------------
+def run_improvement_analysis():
+    with StepTimer("Full improvement analysis"):
+        with StepTimer("Load observed data"):
+            infected_obs, rewiring_obs, degree_obs = mod.load_observed_data()
+            obs_mean_summary, obs_rep_summaries = mod.summarize_observed_dataset(
+                infected_obs, rewiring_obs, degree_obs
+            )
+            n_observed_replicates = obs_rep_summaries.shape[0]
+            log(f"Observed dataset loaded. Number of observed replicates = {n_observed_replicates}")
+
+        # -------------------------------------------------
+        # A. Full-summary adjusted ABC on the actual dataset
+        # -------------------------------------------------
+        with StepTimer("A. Adjusted ABC on actual dataset"):
+            shared_draws = generate_shared_abc_draws_counted(
+                obs_rep_summaries=obs_rep_summaries,
+                n_draws=RECOVERY_N_DRAWS,
+                seed=mod.MASTER_SEED,
+                method_label="rejection_abc_full_actual",
+            )
+            log("Building full-summary ABC result for actual dataset")
+            full_result = mod.build_result_for_summary_group("full", shared_draws, obs_mean_summary, obs_rep_summaries)
+
+            log("Applying regression adjustment to actual dataset ABC posterior")
+            adjusted = mod.apply_regression_adjustment(
+                full_result["accepted"],
+                full_result["accepted_summary_matrix"],
+                full_result["obs_group_mean"],
+            )
+            adjusted_actual = adjusted.rename(columns={
+                "beta_adj": "beta",
+                "gamma_adj": "gamma",
+                "rho_adj": "rho",
+            })
+            log(f"Adjusted ABC actual samples ready: n={len(adjusted_actual)}")
+
+        # -------------------------------------------------
+        # B. Synthetic likelihood on the actual dataset
+        # -------------------------------------------------
+        with StepTimer("B. Synthetic likelihood on actual dataset"):
+            group_idx = mod.get_summary_indices("full")
+            obs_group_mean = obs_mean_summary[group_idx]
+            baseline_center = adjusted_actual[["beta", "gamma", "rho"]].mean(axis=0).to_numpy()
+            log(f"Baseline center for actual SL = {baseline_center.tolist()}")
+
+            _, sl_kept_actual, sl_meta_actual = synthetic_likelihood_mcmc_counted(
+                obs_group_mean=obs_group_mean,
+                baseline_center=baseline_center,
+                n_replicates=n_observed_replicates,
+                n_iter=RECOVERY_SL_N_ITER,
+                burn=RECOVERY_SL_BURN,
+                thin=RECOVERY_SL_THIN,
+                proposal_sd=mod.SL_PROPOSAL_SD,
+                n_estimation_reps=RECOVERY_SL_ESTIMATION_REPS,
+                seed=mod.MASTER_SEED + 99,
+                method_label="synthetic_likelihood_actual",
+            )
+            log(f"Synthetic likelihood actual kept samples: n={len(sl_kept_actual)}")
+
+        # -------------------------------------------------
+        # C. Synthetic-truth recovery run
+        # -------------------------------------------------
+        with StepTimer("C. Synthetic-truth recovery run"):
+            synth_inf, synth_rew, synth_deg = simulate_dataset_to_dataframes(
+                theta=THETA_TRUE,
+                n_replicates=n_observed_replicates,
+                seed=SYNTHETIC_DATA_SEED,
+            )
+            synth_mean_summary, synth_rep_summaries = mod.summarize_observed_dataset(
+                synth_inf, synth_rew, synth_deg
+            )
+            log("Synthetic observed dataset summarized.")
+
+            synth_shared_draws = generate_shared_abc_draws_counted(
+                obs_rep_summaries=synth_rep_summaries,
+                n_draws=RECOVERY_N_DRAWS,
+                seed=mod.MASTER_SEED + 500,
+                method_label="rejection_abc_full_synthtruth",
+            )
+
+            log("Building full-summary ABC result for synthetic-truth dataset")
+            synth_full_result = mod.build_result_for_summary_group(
+                "full", synth_shared_draws, synth_mean_summary, synth_rep_summaries
+            )
+
+            log("Applying regression adjustment to synthetic-truth ABC posterior")
+            synth_adjusted = mod.apply_regression_adjustment(
+                synth_full_result["accepted"],
+                synth_full_result["accepted_summary_matrix"],
+                synth_full_result["obs_group_mean"],
+            ).rename(columns={"beta_adj": "beta", "gamma_adj": "gamma", "rho_adj": "rho"})
+            log(f"Adjusted ABC synth-truth samples ready: n={len(synth_adjusted)}")
+
+            synth_group_idx = mod.get_summary_indices("full")
+            synth_group_mean = synth_mean_summary[synth_group_idx]
+            synth_baseline_center = synth_adjusted[["beta", "gamma", "rho"]].mean(axis=0).to_numpy()
+            log(f"Baseline center for synthetic-truth SL = {synth_baseline_center.tolist()}")
+
+            _, sl_kept_synth, sl_meta_synth = synthetic_likelihood_mcmc_counted(
+                obs_group_mean=synth_group_mean,
+                baseline_center=synth_baseline_center,
+                n_replicates=n_observed_replicates,
+                n_iter=RECOVERY_SL_N_ITER,
+                burn=RECOVERY_SL_BURN,
+                thin=RECOVERY_SL_THIN,
+                proposal_sd=mod.SL_PROPOSAL_SD,
+                n_estimation_reps=RECOVERY_SL_ESTIMATION_REPS,
+                seed=mod.MASTER_SEED + 600,
+                method_label="synthetic_likelihood_synthtruth",
+            )
+            log(f"Synthetic likelihood synth-truth kept samples: n={len(sl_kept_synth)}")
+
+        # -------------------------------------------------
+        # D. Summaries for the report
+        # -------------------------------------------------
+        with StepTimer("D. Build result tables and save outputs"):
+            confounding_df = pd.concat([
+                beta_rho_confounding(adjusted_actual, "adjusted_abc_full_actual"),
+                beta_rho_confounding(sl_kept_actual[["beta", "gamma", "rho"]], "synthetic_likelihood_actual"),
+            ], ignore_index=True)
+
+            recovery_df = pd.concat([
+                posterior_recovery_summary(synth_adjusted, "adjusted_abc_full_synthtruth", THETA_TRUE),
+                posterior_recovery_summary(sl_kept_synth[["beta", "gamma", "rho"]], "synthetic_likelihood_synthtruth", THETA_TRUE),
+            ], ignore_index=True)
+
+            budget_df = BUDGET.to_frame()
+
+            recovery_text = []
+            for method_name, g in recovery_df.groupby("method"):
+                covered = int(g["covered_by_95ci"].sum())
+                recovery_text.append(f"{method_name}: {covered}/3 true parameters covered by 95% credible intervals")
+
+            interpretation = {
+                "theta_true": {
+                    "beta": float(THETA_TRUE[0]),
+                    "gamma": float(THETA_TRUE[1]),
+                    "rho": float(THETA_TRUE[2]),
+                },
+                "beta_rho_confounding_comment": (
+                    "More negative corr(beta, rho) means stronger residual confounding. "
+                    "Compare adjusted ABC on the full summary set against synthetic likelihood."
+                ),
+                "recovery_comment": (
+                    "A well-calibrated method should place the true synthetic parameter inside its 95% interval "
+                    "for most parameters. Very narrow intervals with poor coverage are a warning sign."
+                ),
+                "synthetic_likelihood_meta_actual": sl_meta_actual,
+                "synthetic_likelihood_meta_synthtruth": sl_meta_synth,
+                "recovery_headline": recovery_text,
+            }
+
+            log("Saving output files...")
+            transparency_path = OUTPUT_DIR / "transparency_paragraph.txt"
+            transparency_path.write_text(make_transparency_paragraph(), encoding="utf-8")
+
+            confounding_df.to_csv(OUTPUT_DIR / "beta_rho_confounding.csv", index=False)
+            recovery_df.to_csv(OUTPUT_DIR / "synthetic_truth_recovery.csv", index=False)
+            budget_df.to_csv(OUTPUT_DIR / "simulation_budget.csv", index=False)
+            adjusted_actual.to_csv(OUTPUT_DIR / "adjusted_abc_full_actual_samples.csv", index=False)
+            sl_kept_actual.to_csv(OUTPUT_DIR / "synthetic_likelihood_actual_samples.csv", index=False)
+            synth_adjusted.to_csv(OUTPUT_DIR / "adjusted_abc_synthtruth_samples.csv", index=False)
+            sl_kept_synth.to_csv(OUTPUT_DIR / "synthetic_likelihood_synthtruth_samples.csv", index=False)
+            (OUTPUT_DIR / "improvement_interpretation.json").write_text(
+                json.dumps(interpretation, indent=2), encoding="utf-8"
+            )
+
+            report_lines = []
+            report_lines.append("ST3246 improvements add-on summary")
+            report_lines.append("")
+            report_lines.append("1) Synthetic-truth recovery")
+            report_lines.append(recovery_df.to_string(index=False))
+            report_lines.append("")
+            report_lines.append("2) Residual beta-rho confounding")
+            report_lines.append(confounding_df.to_string(index=False))
+            report_lines.append("")
+            report_lines.append("3) Explicit simulation budget")
+            report_lines.append(budget_df.to_string(index=False))
+            report_lines.append("")
+            report_lines.append("4) Transparency paragraph")
+            report_lines.append(make_transparency_paragraph())
+            (OUTPUT_DIR / "improvement_summary.txt").write_text("\n".join(report_lines), encoding="utf-8")
+
+            log("All output files saved successfully.")
+
+        log("Done. Outputs written to: " + str(OUTPUT_DIR))
+
+
+if __name__ == "__main__":
+    run_improvement_analysis()
